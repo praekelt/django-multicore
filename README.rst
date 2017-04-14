@@ -65,6 +65,59 @@ because the overhead becomes too much.::
 
     print ", ".join(task.get())
 
+If we control the code it's easy but sometimes we need to monkey patch code in
+another app. Django Rest Framework's list fetch is a prime candidate for parallelization.
+Here's the original code (pagination block omitted for brevity)::
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+Rewriting it requires a *lot* of knowledge of how DRF works.::
+
+    import importlib
+    from django.core.urlresolvers import resolve
+    from rest_framework.mixins import ListModelMixin
+    from multicore import Task
+    from multicore.utils import ranges
+
+
+    def helper(request, version, versioning_scheme, start, end):
+        view_func, args, kwargs = resolve(request.get_full_path())
+        module = importlib.import_module(view_func.__module__)
+        view = getattr(module, view_func.__name__)()
+        request.version, request.versioning_scheme = version, versioning_scheme
+        setattr(view, "request", request)
+        view.format_kwarg = view.get_format_suffix()
+        queryset = view.filter_queryset(view.get_queryset())
+        serializer = view.get_serializer(queryset[start:end], many=True)
+        return serializer.data
+
+
+    def mylist(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        task = Task()
+        if task is not None:
+            for start, end in ranges(queryset):
+                task.run(
+                    helper, request._request, request.version,
+                    request.versioning_scheme, start, end
+                )
+
+            # Get results and combine the lists
+            results = [item for sublist in task.get() for item in sublist]
+            return Response(results)
+
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            results = serializer.data
+
+        return Response(results)
+
+    ListModelMixin.list = mylist
+
 Settings
 --------
 
@@ -107,7 +160,7 @@ Do you have any benchmarks?
 
 No, because this is just an interface, not a collection of parallel code.
 
-Okay... the unit test is 3 times faster on a quad core machine. And I have
-Django Rest Framework serializer code ready that runs twice as fast on a quad
-core machine. I will add it to the `usage` section when it is production ready.
+Okay... the unit test is 3 times as fast on a quad core machine. And the Django
+Rest Framework code in this doc is 2 times as fast on the same quad core
+machine. Note that it is very dependent on the type of serializer and data.
 
