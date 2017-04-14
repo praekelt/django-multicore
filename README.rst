@@ -100,3 +100,12 @@ Why didn't you use multiprocessing.Pool?
 
 It just has too many issues with Django when it comes to scoping.
 
+Do you have any benchmarks?
+***************************
+
+No, because this is just an interface, not a collection of parallel code.
+
+Okay... the unit test is 3 times faster on a quad core machine. And I have
+Django Rest Framework serializer code ready that runs twice as fast on a quad
+core machine. I will add it to the `usage` section when it is production ready.
+
