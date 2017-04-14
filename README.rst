@@ -36,8 +36,7 @@ Features
 Usage
 -----
 
-Render 100 users
-****************
+Render 100 users::
 
     import time
     from multicore import Task
@@ -71,7 +70,7 @@ If the system load average exceeds this value then a multicore task won't be
 created and your code must fall back to a synchronous code path. Note that this
 value is for a single core machine and is automatically converted to reflect
 the actual number of cores on the machine. A value of None (the default) always
-creates a multicore task.
+creates a multicore task::
 
     MULTICORE = {"max-load-average": 85}
 
