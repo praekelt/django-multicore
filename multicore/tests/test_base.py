@@ -5,7 +5,7 @@ from django.conf import settings
 from django.test import TestCase
 
 from multicore import NUMBER_OF_WORKERS, Task, initialize, shutdown
-
+from multicore.utils import ranges
 
 # We unfortunately can't show a database test because the Django testing
 # framework attempt to create a test database for each sub-process. Make our
@@ -20,11 +20,11 @@ def expensive_render(user):
     return user["username"]
 
 
-def multi_expensive_render(offset, delta):
+def multi_expensive_render(start, end):
     """Do multiple expensive renders"""
 
     s = ""
-    for user in users[offset:offset+delta]:
+    for user in users[start:end]:
         s += expensive_render(user)
     return s
 
@@ -44,23 +44,20 @@ class TaskTestCase(TestCase):
     def test_parallel(self):
 
         # Sync
-        start = time.time()
+        t_start = time.time()
         s_sync = ""
         for user in users:
             s_sync += expensive_render(user)
-        duration_sync = time.time() - start
+        duration_sync = time.time() - t_start
 
         # Async. Break into chunks of tasks.
-        start = time.time()
-        task = Task(ignore_load=True)
-        count = len(users)
-        delta = int(math.ceil(count * 1.0 / NUMBER_OF_WORKERS))
-        offset = 0
-        while offset < count:
-            task.run(multi_expensive_render, offset, delta)
-            offset += delta
+        t_start = time.time()
+        task = Task()
+        for start, end in ranges(users):
+            task.run(multi_expensive_render, start, end)
+
         s_async = "".join(task.get())
-        duration_async = time.time() - start
+        duration_async = time.time() - t_start
 
         # Hopefully we're on a multicore machine :)
         self.assertEqual(s_sync, s_async)

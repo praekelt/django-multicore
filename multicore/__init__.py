@@ -1,9 +1,12 @@
 import multiprocessing
+import os
 import time
 import traceback
 from Queue import Empty
 
 import dill
+
+from django.conf import settings
 
 
 default_app_config = "multicore.app.MulticoreAppConfig"
@@ -48,7 +51,21 @@ class Traceback(object):
 
 class Task(object):
 
-    def __init__(self, ignore_load=False):
+    def __new__(cls, *args, **kwargs):
+        # If the load average for the last minute is larger than a defined
+        # threshold then don't return a task. Note that the threshold is
+        # specified as for a single core machine, so we multiply it with the
+        # number of workers. "None" is the default and always allows a task
+        # to be returned.
+        try:
+            v = settings.MULTICORE["max-load-average"]
+        except (AttributeError, KeyError):
+            v = None
+        if (v is not None) and (os.getloadavg()[0] > v * NUMBER_OF_WORKERS):
+            return None
+        return super(Task, cls).__new__(cls, *args, **kwargs)
+
+    def __init__(self, **kwargs):
         self.results = multiprocessing.Manager().Queue()
         self.count = 0
 
