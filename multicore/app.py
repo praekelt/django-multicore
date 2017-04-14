@@ -8,5 +8,4 @@ class MulticoreAppConfig(AppConfig):
     verbose_name = "Multicore"
 
     def ready(self):
-        print "CALL INITIALIZE"
         initialize()
