@@ -12,7 +12,7 @@ Django Multicore
 Installation
 ------------
 
-#. Install or add ``django-multicore`` to your Python path.
+#. Install or add ``dill`` and ``django-multicore`` to your Python path.
 
 #. Add ``multicore`` to your ``INSTALLED_APPS`` setting.
 
