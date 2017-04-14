@@ -36,7 +36,9 @@ Features
 Usage
 -----
 
-Render 100 users::
+Let's render 100 users. Always break a large task into smaller tasks, but not
+too small! If the ranges are too small then tasks aren't worth the effort
+because the overhead becomes too much.::
 
     import time
     from multicore import Task
@@ -56,7 +58,7 @@ Render 100 users::
 
 
     task = Task()
-    users = User.objects.all()
+    users = User.objects.all()[:100]
     for start, end in ranges(users):
         # Note we don't pass "users" to run because it can't be pickled
         task.run(multi_expensive_render, start, end)
