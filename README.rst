@@ -118,6 +118,10 @@ Rewriting it requires a *lot* of knowledge of how DRF works.::
 
     ListModelMixin.list = mylist
 
+The ``run`` method takes an optional parameter ``serialization_format`` with value
+``pickle`` (the default), ``json`` or ``string``. Pickle is slow and safe. If you
+know what type of data you have (you should!) set this as appropriate.
+
 Settings
 --------
 
@@ -128,6 +132,13 @@ the actual number of cores on the machine. A value of None (the default) always
 creates a multicore task::
 
     MULTICORE = {"max-load-average": 85}
+
+Multicore attempts to use pipes for inter-process communication but you may instruct it to
+use the filesystem. In fact, with PyPy you cannot use pipes and it will automatically
+switch to temporary files.::
+
+    MULTICORE = {"pipes": False}
+
 
 FAQ's
 -----
