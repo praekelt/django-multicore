@@ -2,10 +2,11 @@ import math
 import time
 
 from django.conf import settings
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
-from multicore import NUMBER_OF_WORKERS, Task, initialize, shutdown
+from multicore import Task, initialize, shutdown
 from multicore.utils import ranges
+
 
 # We unfortunately can't show a database test because the Django testing
 # framework attempt to create a test database for each sub-process. Make our
@@ -31,37 +32,67 @@ def multi_expensive_render(start, end):
 
 class TaskTestCase(TestCase):
 
-    @classmethod
-    def setUpClass(cls):
-        super(TaskTestCase, cls).setUpClass()
-        initialize()
-
-    @classmethod
-    def tearDownClass(cls):
-        super(TaskTestCase, cls).tearDownClass()
+    def setUp(self):
+        super(TaskTestCase, self).setUp()
         shutdown()
 
-    def test_parallel(self):
 
-        # Sync
-        t_start = time.time()
-        s_sync = ""
-        for user in users:
-            s_sync += expensive_render(user)
-        duration_sync = time.time() - t_start
+    def tearDown(self):
+        super(TaskTestCase, self).tearDown()
+        shutdown()
 
-        # Async. Break into chunks of tasks.
-        t_start = time.time()
-        task = Task()
-        for start, end in ranges(users):
-            task.run(multi_expensive_render, start, end)
+    def test_pipes(self):
+        print "test_pipes"
+        with override_settings(MULTICORE={"pipes": True}):
+            # Initialize manually because we change a fundemental setting
+            initialize()
 
-        s_async = "".join(task.get())
-        duration_async = time.time() - t_start
+            # Sync
+            t_start = time.time()
+            s_sync = ""
+            for user in users:
+                s_sync += expensive_render(user)
+            duration_sync = time.time() - t_start
 
-        # Hopefully we're on a multicore machine :)
-        self.assertEqual(s_sync, s_async)
-        self.failUnless(duration_async < duration_sync)
+            # Async. Break into chunks of tasks.
+            t_start = time.time()
+            task = Task()
+            for start, end in ranges(users):
+                task.run(multi_expensive_render, start, end)
+
+            s_async = "".join(task.get())
+            duration_async = time.time() - t_start
+
+            # Hopefully we're on a multicore machine :)
+            self.assertEqual(s_sync, s_async)
+            self.failUnless(duration_async < duration_sync)
+
+    def test_files(self):
+        print "test_files"
+        with override_settings(MULTICORE={"pipes": False}):
+            # Initialize manually because we change a fundemental setting
+            initialize()
+
+            # Sync
+            t_start = time.time()
+            s_sync = ""
+            for user in users:
+                s_sync += expensive_render(user)
+            duration_sync = time.time() - t_start
+
+            # Async. Break into chunks of tasks.
+            t_start = time.time()
+            task = Task()
+            for start, end in ranges(users):
+                task.run(multi_expensive_render, start, end)
+
+            s_async = "".join(task.get())
+            duration_async = time.time() - t_start
+
+            # Hopefully we're on a multicore machine :)
+            self.assertEqual(s_sync, s_async)
+            self.failUnless(duration_async < duration_sync)
 
     def test_no_deadlock(self):
-        pass
+        print "test_no_deadlock"
+        initialize()
