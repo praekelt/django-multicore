@@ -66,6 +66,10 @@ class Traceback(object):
         raise self.exc.__class__(self.msg)
 
 
+class TimeoutExceededError(Exception):
+    pass
+
+
 class Task(object):
 
     def __new__(cls, *args, **kwargs):
@@ -115,7 +119,7 @@ class Task(object):
         self.count += 1
 
 
-    def get(self, timeout=10):
+    def get(self, timeout=10.0):
         datas = [None] * self.count
 
         if self.use_pipes:
@@ -126,19 +130,24 @@ class Task(object):
         else:
             # Monitor directory to see if files are complete. Exhaustive checks
             # are luckily quite fast.
+            start = time.time()
             while True:
                 filenames = os.listdir(self.path)
                 if (len(filenames) == self.count):
-                    filenames.sort()
+                    filenames.sort(lambda a, b: cmp(int(a), int(b)))
                     filenames = [os.path.join(self.path, f) for f in filenames]
                     if all([os.path.getsize(f) for f in filenames]):
                         for n, filename in enumerate(filenames):
+                            print "FILENAME = %s" % filename
                             fp = open(filename, "r")
                             try:
                                 datas[n] = fp.read()
+                                print datas[n]
                             finally:
                                 fp.close()
                         break
+                if time.time() - start > timeout:
+                    raise TimeoutExceededError()
                 time.sleep(0.01)
             rmtree(self.path)
 

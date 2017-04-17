@@ -42,7 +42,6 @@ class TaskTestCase(TestCase):
         shutdown()
 
     def test_pipes(self):
-        print "test_pipes"
         with override_settings(MULTICORE={"pipes": True}):
             # Initialize manually because we change a fundemental setting
             initialize()
@@ -68,7 +67,6 @@ class TaskTestCase(TestCase):
             self.failUnless(duration_async < duration_sync)
 
     def test_files(self):
-        print "test_files"
         with override_settings(MULTICORE={"pipes": False}):
             # Initialize manually because we change a fundemental setting
             initialize()
@@ -94,5 +92,4 @@ class TaskTestCase(TestCase):
             self.failUnless(duration_async < duration_sync)
 
     def test_no_deadlock(self):
-        print "test_no_deadlock"
         initialize()
