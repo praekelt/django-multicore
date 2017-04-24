@@ -1,9 +1,16 @@
 language: python
+python:
+    - "2.7"
+    - "3.5"
+    - "pypy"
+    - "pypy3"
 
 env:
   - TOXENV=django19
   - TOXENV=django110
-  - TOXENV=django111
+  - TOXENV=django111-py27
+  - TOXENV=django111-pypy27
+  - TOXENV=django111-pypy35
 
 install:
   - pip install tox
