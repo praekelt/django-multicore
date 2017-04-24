@@ -1,4 +1,7 @@
-import cPickle
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 import json
 import multiprocessing
 import os
@@ -8,7 +11,6 @@ import tempfile
 import time
 import traceback
 from collections import OrderedDict
-from Queue import Empty
 from shutil import rmtree
 
 import dill
@@ -16,15 +18,34 @@ import dill
 from django.conf import settings
 
 
-# PyPy doesn't support the reduction function we require on Python 2.x yet but
-# try and import in any case. use_pipes guards against misuse.
-PIPE_REDUCTION = False
-if sys.version_info[0] < 3:
-    try:
-        from multiprocessing import reduction
-        PIPE_REDUCTION = True
-    except ImportError:
-        pass
+PY3 = sys.version_info[0] == 3
+
+# PyPy doesn't allow importing of the reduction module because of a platform
+# mismatch issue.  We prefer to use it so try and import it in any case. There
+# is a file-based fallback code path.
+HAS_REDUCTION = False
+try:
+    from multiprocessing import reduction
+    HAS_REDUCTION = True
+except ImportError:
+    pass
+
+# Python 3.5 deprecates the reduce_connection function. Until I figure out how
+# to do it the new way provide these functions.
+if HAS_REDUCTION and not hasattr(reduction, "reduce_connection"):
+
+    def reduce_connection(conn):
+        df = reduction.DupFd(conn.fileno())
+        return rebuild_connection, (df, conn.readable, conn.writable)
+
+    def rebuild_connection(df, readable, writable):
+        from multiprocessing.connection import Connection
+        fd = df.detach()
+        return Connection(fd, readable, writable)
+
+    reduction.reduce_connection = reduce_connection
+    reduction.rebuild_connection = rebuild_connection
+
 
 default_app_config = "multicore.app.MulticoreAppConfig"
 NUMBER_OF_WORKERS = multiprocessing.cpu_count()
@@ -106,10 +127,7 @@ class Task(object):
             # expains why reduction is required.
             receiver, pipe = multiprocessing.Pipe(False)
             self.receivers[self.count] = receiver
-            if PIPE_REDUCTION:
-                arg = cPickle.dumps(reduction.reduce_connection(pipe))
-            else:
-                arg = cPickle.dumps(pipe)
+            arg = pickle.dumps(reduction.reduce_connection(pipe))
         else:
             arg = self.path
         _queue.put((
@@ -118,14 +136,13 @@ class Task(object):
         ))
         self.count += 1
 
-
     def get(self, timeout=10.0):
         datas = [None] * self.count
 
         if self.use_pipes:
             for i, receiver in self.receivers.items():
-                data = receiver.recv()
-                datas[i] = data
+                 data = receiver.recv()
+                 datas[i] = data
 
         else:
             # Monitor directory to see if files are complete. Exhaustive checks
@@ -134,15 +151,13 @@ class Task(object):
             while True:
                 filenames = os.listdir(self.path)
                 if (len(filenames) == self.count):
-                    filenames.sort(lambda a, b: cmp(int(a), int(b)))
+                    filenames.sort(key=lambda f: int(f))
                     filenames = [os.path.join(self.path, f) for f in filenames]
                     if all([os.path.getsize(f) for f in filenames]):
                         for n, filename in enumerate(filenames):
-                            print "FILENAME = %s" % filename
                             fp = open(filename, "r")
                             try:
                                 datas[n] = fp.read()
-                                print datas[n]
                             finally:
                                 fp.close()
                         break
@@ -156,7 +171,10 @@ class Task(object):
         for data in datas:
             serialization_format = data[:6].strip()
             if serialization_format == "pickle":
-                result = cPickle.loads(data[6:])
+                if PY3:
+                    result = pickle.loads(bytes(data[6:], "ascii"))
+                else:
+                    result = pickle.loads(data[6:])
             elif serialization_format == "json":
                 result = json.loads(data[6:])
             else:
@@ -175,62 +193,65 @@ def fetch_and_run():
     while True:
 
         # Fetch task and run it
-        try:
-            index, pipe_or_path, runnable, serialization_format, args, \
-                kwargs = _queue.get()
-        except Empty:
-            pass
+        index, pipe_or_path, runnable, serialization_format, args, \
+            kwargs = _queue.get()
+
+        if use_pipes():
+            f, a = pickle.loads(pipe_or_path)
+            pipe = f(*a)
         else:
+            path = pipe_or_path
+            filename = os.path.join(path, str(index))
+
+        runnable = dill.loads(runnable)
+        args = dill.loads(args)
+        try:
+            result = runnable(*args)
+
+            if serialization_format == "pickle":
+                if PY3:
+                    serialized = pickle.dumps(result, 0).decode()
+                else:
+                    serialized = pickle.dumps(result)
+            elif serialization_format == "json":
+                # We need it to be 6 chars
+                serialization_format = "json  "
+                serialized = json.dumps(result, indent=4)
+            elif serialization_format == "string":
+                serialized = result
             if use_pipes():
-                f, a = cPickle.loads(pipe_or_path)
-                pipe = f(*a)
+                pipe.send(serialization_format + serialized)
+                pipe.close()
             else:
-                path = pipe_or_path
-                filename = os.path.join(path, str(index))
+                fp = open(filename, "w")
+                try:
+                    fp.write(serialization_format + serialized)
+                finally:
+                    fp.close()
 
-            runnable = dill.loads(runnable)
-            args = dill.loads(args)
-            try:
-                result = runnable(*args)
-
-                if serialization_format == "pickle":
-                    serialized = cPickle.dumps(result)
-                elif serialization_format == "json":
-                    # We need it to be 6 chars
-                    serialization_format = "json  "
-                    serialized = json.dumps(result, indent=4)
-                elif serialization_format == "string":
-                    serialized = result
-                if use_pipes():
-                    pipe.send(serialization_format + serialized)
-                else:
-                    fp = open(filename, "w")
-                    try:
-                        fp.write(serialization_format + serialized)
-                    finally:
-                        fp.close()
-
-            except Exception as exc:
-                msg = traceback.format_exc()
-                if use_pipes():
-                    pipe.send(
-                        serialization_format
-                        + cPickle.dumps(Traceback(exc, msg))
+        except Exception as exc:
+            msg = traceback.format_exc()
+            if use_pipes():
+                # todo: py2 and py3 specific handling
+                pipe.send(
+                    serialization_format
+                    + pickle.dumps(Traceback(exc, msg))
+                )
+                pipe.close()
+            else:
+                fp = open(filename, "w")
+                try:
+                    fp.write(
+                        "pickle" \
+                        + pickle.dumps((index, Traceback(exc, msg)))
                     )
-                else:
-                    fp = open(filename, "w")
-                    try:
-                        fp.write(
-                            "pickle" \
-                            + cPickle.dumps((index, Traceback(exc, msg)))
-                        )
-                    finally:
-                        fp.close()
+                finally:
+                    fp.close()
 
 
 def use_pipes():
     try:
-        return settings.MULTICORE["pipes"]
+        return settings.MULTICORE["pipes"] and HAS_REDUCTION
     except (AttributeError, KeyError):
         return False
 
