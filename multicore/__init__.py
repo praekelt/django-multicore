@@ -237,11 +237,14 @@ def fetch_and_run():
 
         except Exception as exc:
             msg = traceback.format_exc()
+            if PY3:
+                pickled = pickle.dumps(Traceback(exc, msg), 0).decode()
+            else:
+                pickled = pickle.dumps(Traceback(exc, msg))
             if use_pipes():
-                # todo: py2 and py3 specific handling
                 pipe.send(
                     serialization_format
-                    + pickle.dumps(Traceback(exc, msg))
+                    + pickled
                 )
                 pipe.close()
             else:
@@ -249,7 +252,7 @@ def fetch_and_run():
                 try:
                     fp.write(
                         "pickle" \
-                        + pickle.dumps((index, Traceback(exc, msg)))
+                        + pickled
                     )
                 finally:
                     fp.close()
@@ -257,7 +260,8 @@ def fetch_and_run():
 
 def use_pipes():
     try:
-        return settings.MULTICORE["pipes"] and PIPES_POSSIBLE
+        return getattr(settings, "MULTICORE", {}).get("pipes", True) \
+            and PIPES_POSSIBLE
     except (AttributeError, KeyError):
         return False
 
