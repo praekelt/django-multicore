@@ -5,7 +5,6 @@ except ImportError:
 import json
 import multiprocessing
 import os
-import os.path
 import socket
 import sys
 import tempfile
@@ -17,6 +16,7 @@ from shutil import rmtree
 import dill
 
 from django.conf import settings
+from django.core.handlers.wsgi import WSGIRequest
 
 
 PY3 = sys.version_info[0] == 3
@@ -136,6 +136,7 @@ class Task(object):
             arg = pickle.dumps(reduction.reduce_connection(pipe))
         else:
             arg = self.path
+
         _queue.put((
             self.count, arg, dill.dumps(runnable), serialization_format,
             dill.dumps(args), dill.dumps(kwargs)
@@ -237,11 +238,14 @@ def fetch_and_run():
 
         except Exception as exc:
             msg = traceback.format_exc()
+            if PY3:
+                pickled = pickle.dumps(Traceback(exc, msg), 0).decode()
+            else:
+                pickled = pickle.dumps(Traceback(exc, msg))
             if use_pipes():
-                # todo: py2 and py3 specific handling
                 pipe.send(
                     serialization_format
-                    + pickle.dumps(Traceback(exc, msg))
+                    + pickled
                 )
                 pipe.close()
             else:
@@ -249,7 +253,7 @@ def fetch_and_run():
                 try:
                     fp.write(
                         "pickle" \
-                        + pickle.dumps((index, Traceback(exc, msg)))
+                        + pickled
                     )
                 finally:
                     fp.close()
@@ -257,7 +261,8 @@ def fetch_and_run():
 
 def use_pipes():
     try:
-        return settings.MULTICORE["pipes"] and PIPES_POSSIBLE
+        return getattr(settings, "MULTICORE", {}).get("pipes", True) \
+            and PIPES_POSSIBLE
     except (AttributeError, KeyError):
         return False
 

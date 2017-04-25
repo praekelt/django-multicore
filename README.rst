@@ -80,14 +80,13 @@ Rewriting it requires a *lot* of knowledge of how DRF works.::
     from django.core.urlresolvers import resolve
     from rest_framework.mixins import ListModelMixin
     from multicore import Task
-    from multicore.utils import ranges
+    from multicore.utils import ranges, PicklableWSGIRequest
 
 
-    def helper(request, version, versioning_scheme, start, end):
+    def helper(request, start, end):
         view_func, args, kwargs = resolve(request.get_full_path())
         module = importlib.import_module(view_func.__module__)
         view = getattr(module, view_func.__name__)()
-        request.version, request.versioning_scheme = version, versioning_scheme
         setattr(view, "request", request)
         view.format_kwarg = view.get_format_suffix()
         queryset = view.filter_queryset(view.get_queryset())
@@ -102,8 +101,8 @@ Rewriting it requires a *lot* of knowledge of how DRF works.::
         if task is not None:
             for start, end in ranges(queryset):
                 task.run(
-                    helper, request._request, request.version,
-                    request.versioning_scheme, start, end
+                    helper, PicklableWSGIRequest(request._request),
+                    start, end
                 )
 
             # Get results and combine the lists
