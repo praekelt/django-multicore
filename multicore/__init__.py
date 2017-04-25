@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import os.path
+import socket
 import sys
 import tempfile
 import time
@@ -20,19 +21,24 @@ from django.conf import settings
 
 PY3 = sys.version_info[0] == 3
 
-# PyPy doesn't allow importing of the reduction module because of a platform
+# PyPy 2 doesn't allow importing of the reduction module because of a platform
 # mismatch issue.  We prefer to use it so try and import it in any case. There
 # is a file-based fallback code path.
-HAS_REDUCTION = False
+PIPES_POSSIBLE = False
 try:
     from multiprocessing import reduction
-    HAS_REDUCTION = True
+    PIPES_POSSIBLE = True
 except ImportError:
     pass
 
+# Python 3 and PyPy 3 allows checking for SCM_RIGHTS. Without these rights
+# pipes aren't possible.
+if PY3 and not hasattr(socket, "SCM_RIGHTS"):
+    PIPES_POSSIBLE = False
+
 # Python 3.5 deprecates the reduce_connection function. Until I figure out how
 # to do it the new way provide these functions.
-if HAS_REDUCTION and not hasattr(reduction, "reduce_connection"):
+if PIPES_POSSIBLE and not hasattr(reduction, "reduce_connection"):
 
     def reduce_connection(conn):
         df = reduction.DupFd(conn.fileno())
@@ -251,7 +257,7 @@ def fetch_and_run():
 
 def use_pipes():
     try:
-        return settings.MULTICORE["pipes"] and HAS_REDUCTION
+        return settings.MULTICORE["pipes"] and PIPES_POSSIBLE
     except (AttributeError, KeyError):
         return False
 

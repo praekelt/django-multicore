@@ -12,8 +12,8 @@ matrix:
           env: TOXENV=django111-py35
         - python: pypy
           env: TOXENV=django111-pypy27
-        #- python: pypy=5.3.1
-        #  env: TOXENV=django111-pypy35
+        - python: pypy=5.3.1
+          env: TOXENV=django111-pypy35
 
 install:
   - pip install tox
