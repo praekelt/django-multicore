@@ -121,6 +121,10 @@ The ``run`` method takes an optional parameter ``serialization_format`` with val
 ``pickle`` (the default), ``json`` or ``string``. Pickle is slow and safe. If you
 know what type of data you have (you should!) set this as appropriate.
 
+The ``run`` method also takes an optional parameter ``use_dill`` with default
+value ``False``. Dill is a library that can often pickle things that can't be
+pickled by the standard pickler but it is slightly slower.
+
 Settings
 --------
 

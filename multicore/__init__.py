@@ -122,11 +122,15 @@ class Task(object):
             self.path = tempfile.mkdtemp()
 
     def run(self, runnable, *args, **kwargs):
+        global _queue
+
         serialization_format = kwargs.pop("serialization_format", "pickle")
         if serialization_format not in ("pickle", "json", "string"):
             raise RuntimeError(
                 "Unrecognized serialization_format %s" % serialization_format
             )
+
+        use_dill = kwargs.pop("use_dill", False)
 
         if self.use_pipes:
             # http://stackoverflow.com/questions/1446004/python-2-6-send-connection-object-over-queue-pipe-etc
@@ -137,10 +141,17 @@ class Task(object):
         else:
             arg = self.path
 
-        _queue.put((
-            self.count, arg, dill.dumps(runnable), serialization_format,
-            dill.dumps(args), dill.dumps(kwargs)
-        ))
+        if not use_dill:
+            _queue.put((
+                self.count, arg, runnable, serialization_format, use_dill,
+                args, kwargs
+            ))
+        else:
+            _queue.put((
+                self.count, arg, dill.dumps(runnable), serialization_format, use_dill,
+                dill.dumps(args), dill.dumps(kwargs)
+            ))
+
         self.count += 1
 
     def get(self, timeout=10.0):
@@ -154,7 +165,11 @@ class Task(object):
         else:
             # Monitor directory to see if files are complete. Exhaustive checks
             # are luckily quite fast.
-            start = time.time()
+
+            # Avoid floating point operations on each loop by calculating the
+            # maximum number of iterations.
+            max_iterations = int(timeout / 0.001)
+
             while True:
                 filenames = os.listdir(self.path)
                 if (len(filenames) == self.count):
@@ -168,9 +183,10 @@ class Task(object):
                             finally:
                                 fp.close()
                         break
-                if time.time() - start > timeout:
+                max_iterations -= 1
+                if max_iterations <= 0:
                     raise TimeoutExceededError()
-                time.sleep(0.01)
+                time.sleep(0.001)
             rmtree(self.path)
 
         # Convert list and possibly raise exception
@@ -200,7 +216,7 @@ def fetch_and_run():
     while True:
 
         # Fetch task and run it
-        index, pipe_or_path, runnable, serialization_format, args, \
+        index, pipe_or_path, runnable, serialization_format, use_dill, args, \
             kwargs = _queue.get()
 
         if use_pipes():
@@ -210,8 +226,10 @@ def fetch_and_run():
             path = pipe_or_path
             filename = os.path.join(path, str(index))
 
-        runnable = dill.loads(runnable)
-        args = dill.loads(args)
+        if use_dill:
+            runnable = dill.loads(runnable)
+            args = dill.loads(args)
+
         try:
             result = runnable(*args)
 
@@ -233,6 +251,7 @@ def fetch_and_run():
                 fp = open(filename, "w")
                 try:
                     fp.write(serialization_format + serialized)
+                    fp.flush()
                 finally:
                     fp.close()
 
@@ -279,7 +298,7 @@ def initialize():
     if _queue is not None:
         return
 
-    _queue = multiprocessing.Manager().Queue()
+    _queue = multiprocessing.Queue()
 
     for i in range(0, NUMBER_OF_WORKERS):
         p = Process(target=fetch_and_run)
