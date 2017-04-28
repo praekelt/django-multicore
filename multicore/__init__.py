@@ -298,7 +298,7 @@ def initialize():
     if _queue is not None:
         return
 
-    _queue = multiprocessing.Queue()
+    _queue = multiprocessing.Manager().Queue()
 
     for i in range(0, NUMBER_OF_WORKERS):
         p = Process(target=fetch_and_run)
