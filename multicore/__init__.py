@@ -2,7 +2,9 @@ try:
     import cPickle as pickle
 except ImportError:
     import pickle
+import ctypes
 import json
+import mmap
 import multiprocessing
 import os
 import socket
@@ -11,6 +13,7 @@ import tempfile
 import time
 import traceback
 from collections import OrderedDict
+from multiprocessing.sharedctypes import Array
 from shutil import rmtree
 
 import dill
@@ -21,42 +24,19 @@ from django.core.handlers.wsgi import WSGIRequest
 
 PY3 = sys.version_info[0] == 3
 
-# PyPy 2 doesn't allow importing of the reduction module because of a platform
-# mismatch issue.  We prefer to use it so try and import it in any case. There
-# is a file-based fallback code path.
-PIPES_POSSIBLE = False
-try:
-    from multiprocessing import reduction
-    PIPES_POSSIBLE = True
-except ImportError:
-    pass
-
-# Python 3 and PyPy 3 allows checking for SCM_RIGHTS. Without these rights
-# pipes aren't possible.
-if PY3 and not hasattr(socket, "SCM_RIGHTS"):
-    PIPES_POSSIBLE = False
-
-# Python 3.5 deprecates the reduce_connection function. Until I figure out how
-# to do it the new way provide these functions.
-if PIPES_POSSIBLE and not hasattr(reduction, "reduce_connection"):
-
-    def reduce_connection(conn):
-        df = reduction.DupFd(conn.fileno())
-        return rebuild_connection, (df, conn.readable, conn.writable)
-
-    def rebuild_connection(df, readable, writable):
-        from multiprocessing.connection import Connection
-        fd = df.detach()
-        return Connection(fd, readable, writable)
-
-    reduction.reduce_connection = reduce_connection
-    reduction.rebuild_connection = rebuild_connection
-
-
 default_app_config = "multicore.app.MulticoreAppConfig"
 NUMBER_OF_WORKERS = multiprocessing.cpu_count()
 _workers = []
 _queue = None
+
+#array = Array(ctypes.c_char_p, ["a"*1000, "a"*1000, "a"*1000, "a"*1000], lock=True)
+#array = Array(ctypes.c_char_p, 4, lock=True)
+MMAP_SIZE = 100000
+array = []
+for i in range(NUMBER_OF_WORKERS):
+    array.append(mmap.mmap(-1, MMAP_SIZE))
+
+
 
 
 class Process(multiprocessing.Process):
@@ -115,11 +95,6 @@ class Task(object):
 
     def __init__(self, **kwargs):
         self.count = 0
-        self.use_pipes = use_pipes()
-        if self.use_pipes:
-            self.receivers = OrderedDict()
-        else:
-            self.path = tempfile.mkdtemp()
 
     def run(self, runnable, *args, **kwargs):
         global _queue
@@ -131,75 +106,44 @@ class Task(object):
             )
 
         use_dill = kwargs.pop("use_dill", False)
-
-        if self.use_pipes:
-            # http://stackoverflow.com/questions/1446004/python-2-6-send-connection-object-over-queue-pipe-etc
-            # expains why reduction is required.
-            receiver, pipe = multiprocessing.Pipe(False)
-            self.receivers[self.count] = receiver
-            arg = pickle.dumps(reduction.reduce_connection(pipe))
-        else:
-            arg = self.path
-
-        if not use_dill:
-            _queue.put((
-                self.count, arg, runnable, serialization_format, use_dill,
-                args, kwargs
-            ))
-        else:
-            _queue.put((
-                self.count, arg, dill.dumps(runnable), serialization_format, use_dill,
-                dill.dumps(args), dill.dumps(kwargs)
-            ))
-
+        # todo dill encoding
+        pickled = pickle.dumps(
+            (self.count, runnable, serialization_format, use_dill, args, kwargs), 0
+        ).decode("utf-8")
+        _queue[self.count].seek(0)
+        _queue[self.count].write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
         self.count += 1
 
     def get(self, timeout=10.0):
-        datas = [None] * self.count
+        # Avoid floating point operations on each loop by calculating the
+        # maximum number of iterations.
+        max_iterations = int(timeout / 0.01)
+        datas = [None] * NUMBER_OF_WORKERS
+        fetches = NUMBER_OF_WORKERS
+        while fetches > 0:
+            for index, mm in enumerate(array):
+                if datas[index] is None:
+                    mm.seek(0)
+                    data = mm.read(MMAP_SIZE).decode("utf-8")
+                    if data[0] != "\x00":
+                        datas[index] = data
+                        fetches -= 1
 
-        if self.use_pipes:
-            for i, receiver in self.receivers.items():
-                 data = receiver.recv()
-                 datas[i] = data
-
-        else:
-            # Monitor directory to see if files are complete. Exhaustive checks
-            # are luckily quite fast.
-
-            # Avoid floating point operations on each loop by calculating the
-            # maximum number of iterations.
-            max_iterations = int(timeout / 0.001)
-
-            while True:
-                filenames = os.listdir(self.path)
-                if (len(filenames) == self.count):
-                    filenames.sort(key=lambda f: int(f))
-                    filenames = [os.path.join(self.path, f) for f in filenames]
-                    if all([os.path.getsize(f) for f in filenames]):
-                        for n, filename in enumerate(filenames):
-                            fp = open(filename, "r")
-                            try:
-                                datas[n] = fp.read()
-                            finally:
-                                fp.close()
-                        break
-                max_iterations -= 1
-                if max_iterations <= 0:
-                    raise TimeoutExceededError()
-                time.sleep(0.001)
-            rmtree(self.path)
+            max_iterations -= 1
+            if max_iterations <= 0:
+                raise TimeoutExceededError()
+            time.sleep(0.01)
 
         # Convert list and possibly raise exception
         results = []
         for data in datas:
+            length = int(data[6:12])
+            data = data[:length]
             serialization_format = data[:6].strip()
             if serialization_format == "pickle":
-                if PY3:
-                    result = pickle.loads(bytes(data[6:], "ascii"))
-                else:
-                    result = pickle.loads(data[6:])
+                result = pickle.loads(data[12:].encode("utf-8"))
             elif serialization_format == "json":
-                result = json.loads(data[6:])
+                result = json.loads(data[12:])
             else:
                 result = data[6:]
             results.append(result)
@@ -212,78 +156,43 @@ class Task(object):
 
 def fetch_and_run():
     global _queue
+    global array
 
     while True:
 
-        # Fetch task and run it
-        index, pipe_or_path, runnable, serialization_format, use_dill, args, \
-            kwargs = _queue.get()
+        for mmap in _queue:
+            mmap.seek(0)
+            data = mmap.read(10000).decode("utf-8")
+            if data[0] not in ("", "\x00", b"\x00"):
+                mmap.seek(0)
+                mmap.write(b"\x00")
+                length = int(data[:6])
+                data = data[6:length+6]
+                index, runnable, serialization_format, use_dill, args, \
+                    kwargs = pickle.loads(data.encode("utf-8"))
 
-        if use_pipes():
-            f, a = pickle.loads(pipe_or_path)
-            pipe = f(*a)
-        else:
-            path = pipe_or_path
-            filename = os.path.join(path, str(index))
+                #if use_dill:
+                #    runnable = dill.loads(runnable)
+                #    args = dill.loads(args)
 
-        if use_dill:
-            runnable = dill.loads(runnable)
-            args = dill.loads(args)
-
-        try:
-            result = runnable(*args)
-
-            if serialization_format == "pickle":
-                if PY3:
-                    serialized = pickle.dumps(result, 0).decode()
-                else:
-                    serialized = pickle.dumps(result)
-            elif serialization_format == "json":
-                # We need it to be 6 chars
-                serialization_format = "json  "
-                serialized = json.dumps(result, indent=4)
-            elif serialization_format == "string":
-                serialized = result
-            if use_pipes():
-                pipe.send(serialization_format + serialized)
-                pipe.close()
-            else:
-                fp = open(filename, "w")
                 try:
-                    fp.write(serialization_format + serialized)
-                    fp.flush()
-                finally:
-                    fp.close()
+                    result = runnable(*args)
 
-        except Exception as exc:
-            msg = traceback.format_exc()
-            if PY3:
-                pickled = pickle.dumps(Traceback(exc, msg), 0).decode()
-            else:
-                pickled = pickle.dumps(Traceback(exc, msg))
-            if use_pipes():
-                pipe.send(
-                    serialization_format
-                    + pickled
-                )
-                pipe.close()
-            else:
-                fp = open(filename, "w")
-                try:
-                    fp.write(
-                        "pickle" \
-                        + pickled
-                    )
-                finally:
-                    fp.close()
+                    if serialization_format == "pickle":
+                        serialized = pickle.dumps(result, 0).decode("utf-8")
+                    elif serialization_format == "json":
+                        # We need it to be 6 chars
+                        serialization_format = "json  "
+                        serialized = json.dumps(result, indent=4)
+                    elif serialization_format == "string":
+                        serialized = result
 
-
-def use_pipes():
-    try:
-        return getattr(settings, "MULTICORE", {}).get("pipes", True) \
-            and PIPES_POSSIBLE
-    except (AttributeError, KeyError):
-        return False
+                    array[index].write((serialization_format + "%.6d" % (len(serialized) + 12) + serialized).encode("utf-8"))
+                except Exception as exc:
+                    msg = traceback.format_exc()
+                    pickled = pickle.dumps(Traceback(exc, msg), 0).decode("utf-8")
+                    array[index].write(("pickle" + "%.6d" % (len(pickled) + 12) + pickled).encode("utf-8"))
+        time.sleep(0.01)
 
 
 def initialize():
@@ -298,7 +207,10 @@ def initialize():
     if _queue is not None:
         return
 
-    _queue = multiprocessing.Manager().Queue()
+    _queue = []
+    for i in range(NUMBER_OF_WORKERS):
+        _queue.append(mmap.mmap(-1, 10000))
+
 
     for i in range(0, NUMBER_OF_WORKERS):
         p = Process(target=fetch_and_run)
