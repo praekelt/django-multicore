@@ -2,41 +2,39 @@ try:
     import cPickle as pickle
 except ImportError:
     import pickle
-import ctypes
 import json
 import mmap
 import multiprocessing
 import os
-import socket
-import sys
-import tempfile
 import time
 import traceback
-from collections import OrderedDict
 from multiprocessing.sharedctypes import Array
-from shutil import rmtree
 
 import dill
 
 from django.conf import settings
-from django.core.handlers.wsgi import WSGIRequest
 
-
-PY3 = sys.version_info[0] == 3
 
 default_app_config = "multicore.app.MulticoreAppConfig"
+
+# Workers is a list of processes. The workers are created in initialize.
 NUMBER_OF_WORKERS = multiprocessing.cpu_count()
 _workers = []
-_queue = None
 
-#array = Array(ctypes.c_char_p, ["a"*1000, "a"*1000, "a"*1000, "a"*1000], lock=True)
-#array = Array(ctypes.c_char_p, 4, lock=True)
+# Workers read their instructions from input buffers. The input buffers are
+# created in initialize.
+_input_buffers = None
+
+# An array that keeps track of which input buffers are available. Value 0 at
+# index 10 means input buffer 10 is available.
+_input_buffers_states = None
+
+# Workers write their output to output buffers
 MMAP_SIZE = 100000
-array = []
-for i in range(NUMBER_OF_WORKERS):
-    array.append(mmap.mmap(-1, MMAP_SIZE))
+_output_buffers = None
 
-
+# A lock required when manipulating input buffers
+_lock = multiprocessing.Lock()
 
 
 class Process(multiprocessing.Process):
@@ -77,6 +75,10 @@ class TimeoutExceededError(Exception):
     pass
 
 
+class NoAvailableInputBufferError(Exception):
+    pass
+
+
 class Task(object):
 
     def __new__(cls, *args, **kwargs):
@@ -95,9 +97,12 @@ class Task(object):
 
     def __init__(self, **kwargs):
         self.count = 0
+        # Map buffer index to run index
+        self.buffer_index_map = {}
 
     def run(self, runnable, *args, **kwargs):
-        global _queue
+        global _input_buffers
+        global _lock
 
         serialization_format = kwargs.pop("serialization_format", "pickle")
         if serialization_format not in ("pickle", "json", "string"):
@@ -106,28 +111,55 @@ class Task(object):
             )
 
         use_dill = kwargs.pop("use_dill", False)
-        # todo dill encoding
-        pickled = pickle.dumps(
-            (self.count, runnable, serialization_format, use_dill, args, kwargs), 0
-        ).decode("utf-8")
-        _queue[self.count].seek(0)
-        _queue[self.count].write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
+
+        if not use_dill:
+            pickled = pickle.dumps(
+                (runnable, serialization_format, use_dill, args, kwargs), 0
+            ).decode("utf-8")
+        else:
+            pickled = pickle.dumps(
+                (
+                    dill.dumps(runnable), serialization_format, use_dill,
+                    dill.dumps(args), dill.dumps(kwargs)
+                ),
+                0
+            ).decode("utf-8")
+
+        _lock.acquire()
+        try:
+            index = None
+            for index, state in enumerate(_input_buffers_states):
+                if state == 0:
+                    break
+            if index is None:
+                raise NoAvailableInputBufferError()
+            self.buffer_index_map[index] = self.count
+            mm = _input_buffers[index]
+            mm.seek(0)
+            mm.write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
+            _input_buffers_states[index] = 1
+        finally:
+            _lock.release()
+
         self.count += 1
 
     def get(self, timeout=10.0):
         # Avoid floating point operations on each loop by calculating the
         # maximum number of iterations.
         max_iterations = int(timeout / 0.01)
-        datas = [None] * NUMBER_OF_WORKERS
-        fetches = NUMBER_OF_WORKERS
+        datas = [None] * self.count
+        # all(datas) may be slow, so keep track with a variable
+        fetches = self.count
         while fetches > 0:
-            for index, mm in enumerate(array):
-                if datas[index] is None:
+            for buffer_index, run_index in self.buffer_index_map.items():
+                if datas[run_index] is None:
+                    mm = _output_buffers[buffer_index]
                     mm.seek(0)
                     data = mm.read(MMAP_SIZE).decode("utf-8")
                     if data[0] != "\x00":
-                        datas[index] = data
+                        datas[run_index] = data
                         fetches -= 1
+                        _input_buffers_states[buffer_index] = 0
 
             max_iterations -= 1
             if max_iterations <= 0:
@@ -137,13 +169,13 @@ class Task(object):
         # Convert list and possibly raise exception
         results = []
         for data in datas:
-            length = int(data[6:12])
-            data = data[:length]
+            length = int(data[:6])
+            data = data[6:length+6]
             serialization_format = data[:6].strip()
             if serialization_format == "pickle":
-                result = pickle.loads(data[12:].encode("utf-8"))
+                result = pickle.loads(data[6:].encode("utf-8"))
             elif serialization_format == "json":
-                result = json.loads(data[12:])
+                result = json.loads(data[6:])
             else:
                 result = data[6:]
             results.append(result)
@@ -154,44 +186,88 @@ class Task(object):
         return results
 
 
-def fetch_and_run():
-    global _queue
-    global array
+def fetch_and_run(lock, input_buffers_states):
+    global _input_buffers
+    global _output_buffers
 
     while True:
 
-        for mmap in _queue:
-            mmap.seek(0)
-            data = mmap.read(10000).decode("utf-8")
-            if data[0] not in ("", "\x00", b"\x00"):
-                mmap.seek(0)
-                mmap.write(b"\x00")
-                length = int(data[:6])
-                data = data[6:length+6]
-                index, runnable, serialization_format, use_dill, args, \
-                    kwargs = pickle.loads(data.encode("utf-8"))
+        # Only consider input buffers known to be active
+        for index, status in enumerate(input_buffers_states):
+            if status != 1:
+                time.sleep(0.01)
+                continue
 
-                #if use_dill:
-                #    runnable = dill.loads(runnable)
-                #    args = dill.loads(args)
+            # First check is cheap because we read only one byte
+            mm = _input_buffers[index]
+            mm.seek(0)
+            data = mm.read(1).decode("utf-8")
+            if data[0] == "\x00":
+                time.sleep(0.01)
+                continue
 
-                try:
-                    result = runnable(*args)
+            # Second check reads all the bytes and requires a lock
+            lock.acquire()
+            try:
+                mm.seek(0)
+                data = mm.read(MMAP_SIZE).decode("utf-8")
+                if data[0] != "\x00":
+                    mm.seek(0)
+                    mm.write(b"\x00")
+            finally:
+                lock.release()
 
-                    if serialization_format == "pickle":
-                        serialized = pickle.dumps(result, 0).decode("utf-8")
-                    elif serialization_format == "json":
-                        # We need it to be 6 chars
-                        serialization_format = "json  "
-                        serialized = json.dumps(result, indent=4)
-                    elif serialization_format == "string":
-                        serialized = result
+            # Paranoia check
+            if data[0] == "\x00":
+                time.sleep(0.01)
+                continue
 
-                    array[index].write((serialization_format + "%.6d" % (len(serialized) + 12) + serialized).encode("utf-8"))
-                except Exception as exc:
-                    msg = traceback.format_exc()
-                    pickled = pickle.dumps(Traceback(exc, msg), 0).decode("utf-8")
-                    array[index].write(("pickle" + "%.6d" % (len(pickled) + 12) + pickled).encode("utf-8"))
+            # Decode the bytes
+            length = int(data[:6])
+            data = data[6:length+6]
+            runnable, serialization_format, use_dill, args, \
+                kwargs = pickle.loads(data.encode("utf-8"))
+
+            if use_dill:
+                runnable = dill.loads(runnable)
+                args = dill.loads(args)
+
+            try:
+                result = runnable(*args)
+
+                if serialization_format == "pickle":
+                    serialized = pickle.dumps(result, 0).decode("utf-8")
+                elif serialization_format == "json":
+                    # We need it to be 6 chars
+                    serialization_format = "json  "
+                    serialized = json.dumps(result, indent=4)
+                elif serialization_format == "string":
+                    serialized = result
+
+                # No need for locking because we are guaranteed to be the only
+                # one writing to it.
+                mm = _output_buffers[index]
+                mm.seek(0)
+                mm.write(
+                    (
+                        "%.6d" % (len(serialized) + 6) \
+                        + serialization_format \
+                        + serialized
+                    ).encode("utf-8")
+                )
+            except Exception as exc:
+                msg = traceback.format_exc()
+                pickled = pickle.dumps(Traceback(exc, msg), 0).decode("utf-8")
+                mm = _output_buffers[index]
+                mm.seek(0)
+                mm.write(
+                    (
+                        "%.6d" % (len(pickled) + 6) \
+                        + "pickle" \
+                        + pickled
+                    ).encode("utf-8")
+                )
+
         time.sleep(0.01)
 
 
@@ -200,20 +276,26 @@ def initialize():
     tests."""
 
     global NUMBER_OF_WORKERS
-    global _queue
     global _workers
+    global _input_buffers
+    global _input_buffers_states
+    global _output_buffers
 
-    # If we already have a queue do nothing
-    if _queue is not None:
+    # If we already have workers do nothing
+    if _workers:
         return
 
-    _queue = []
-    for i in range(NUMBER_OF_WORKERS):
-        _queue.append(mmap.mmap(-1, 10000))
+    _input_buffers = []
+    _output_buffers = []
+    for i in range(NUMBER_OF_WORKERS * 8):
+        # Input buffers are smaller than output buffers
+        _input_buffers.append(mmap.mmap(-1, 10000))
+        _output_buffers.append(mmap.mmap(-1, MMAP_SIZE))
 
+    _input_buffers_states = Array("i", NUMBER_OF_WORKERS * 8)
 
     for i in range(0, NUMBER_OF_WORKERS):
-        p = Process(target=fetch_and_run)
+        p = Process(target=fetch_and_run, args=(_lock, _input_buffers_states))
         _workers.append(p)
         p.start()
 
@@ -221,7 +303,6 @@ def initialize():
 def shutdown():
     """Stop the queue workers. Called by unit tests."""
 
-    global _queue
     global _workers
 
     # Immediately set running to false so workers may exit
@@ -231,6 +312,4 @@ def shutdown():
         p.terminate()
         del p
 
-    del _queue
-    _queue = None
     _workers = []
