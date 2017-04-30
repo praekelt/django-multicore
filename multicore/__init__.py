@@ -86,6 +86,10 @@ class NoAvailableInputBufferError(Exception):
     pass
 
 
+class InputBufferTooSmallError(Exception):
+    pass
+
+
 class Task(object):
 
     def __new__(cls, *args, **kwargs):
@@ -150,7 +154,10 @@ class Task(object):
             self.buffer_index_map[index] = self.count
             mm = _input_buffers[index]
             mm.seek(0)
-            mm.write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
+            try:
+                mm.write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
+            except ValueError:
+                raise InputBufferTooSmallError()
 
             # Mark input buffer as holding a job
             _input_buffers_states[index] = 1 if PY3 else "1"
