@@ -136,13 +136,6 @@ creates a multicore task::
 
     MULTICORE = {"max-load-average": 85}
 
-Multicore attempts to use pipes for inter-process communication but you may instruct it to
-use the filesystem. In fact, with PyPy you cannot use pipes and it will automatically
-switch to temporary files.::
-
-    MULTICORE = {"pipes": False}
-
-
 FAQ's
 -----
 

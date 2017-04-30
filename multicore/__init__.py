@@ -6,6 +6,7 @@ import json
 import mmap
 import multiprocessing
 import os
+import sys
 import time
 import traceback
 from multiprocessing.sharedctypes import Array
@@ -14,6 +15,8 @@ import dill
 
 from django.conf import settings
 
+
+PY3 = sys.version_info[0] == 3
 
 default_app_config = "multicore.app.MulticoreAppConfig"
 
@@ -25,16 +28,20 @@ _workers = []
 # created in initialize.
 _input_buffers = None
 
-# An array that keeps track of which input buffers are available. Value 0 at
-# index 10 means input buffer 10 is available.
+# Memory map that records state of input buffers. 0 - available, 1 - job
+# assigned, 2 - in progress, 3 - ready for collection.
 _input_buffers_states = None
 
 # Workers write their output to output buffers
 MMAP_SIZE = 100000
 _output_buffers = None
 
+# The buffers have a large pipeline of jobs
+BUFFER_DEPTH = NUMBER_OF_WORKERS * 8
+
 # A lock required when manipulating input buffers
-_lock = multiprocessing.Lock()
+_lock_run = multiprocessing.Lock()
+_lock_fetch = multiprocessing.Lock()
 
 
 class Process(multiprocessing.Process):
@@ -102,7 +109,7 @@ class Task(object):
 
     def run(self, runnable, *args, **kwargs):
         global _input_buffers
-        global _lock
+        global _lock_run
 
         serialization_format = kwargs.pop("serialization_format", "pickle")
         if serialization_format not in ("pickle", "json", "string"):
@@ -125,46 +132,69 @@ class Task(object):
                 0
             ).decode("utf-8")
 
-        _lock.acquire()
+        _lock_run.acquire()
         try:
-            index = None
-            for index, state in enumerate(_input_buffers_states):
-                if state == 0:
+            # Find the first available worker
+            found = False
+            for index, state in enumerate(_input_buffers_states[:]):
+                if state in (0, "0"):
+                    found = True
                     break
-            if index is None:
+
+            if not found:
+                # Effectively cancel the rest of the task
+                for i in self.buffer_index_map.keys():
+                    _input_buffers_states[index] = 0 if PY3 else "0"
                 raise NoAvailableInputBufferError()
+
             self.buffer_index_map[index] = self.count
             mm = _input_buffers[index]
             mm.seek(0)
             mm.write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
-            _input_buffers_states[index] = 1
+
+            # Mark input buffer as holding a job
+            _input_buffers_states[index] = 1 if PY3 else "1"
+
         finally:
-            _lock.release()
+            _lock_run.release()
 
         self.count += 1
 
     def get(self, timeout=10.0):
+        SLEEP = 0.005
+
         # Avoid floating point operations on each loop by calculating the
         # maximum number of iterations.
-        max_iterations = int(timeout / 0.01)
+        max_iterations = int(timeout / SLEEP)
+
+        # Create sized list because we populate by index
         datas = [None] * self.count
-        # all(datas) may be slow, so keep track with a variable
+
+        will_timeout = False
         fetches = self.count
         while fetches > 0:
-            for buffer_index, run_index in self.buffer_index_map.items():
-                if datas[run_index] is None:
-                    mm = _output_buffers[buffer_index]
-                    mm.seek(0)
-                    data = mm.read(MMAP_SIZE).decode("utf-8")
-                    if data[0] != "\x00":
+            states = _input_buffers_states[:]
+
+            for buf_index, run_index in self.buffer_index_map.items():
+                if (datas[run_index] is None) and (states[buf_index] in (3, "3")):
+                    data = _output_buffers[buf_index][:].decode("utf-8")
+                    if ord(data[0]):
                         datas[run_index] = data
                         fetches -= 1
-                        _input_buffers_states[buffer_index] = 0
 
             max_iterations -= 1
             if max_iterations <= 0:
-                raise TimeoutExceededError()
-            time.sleep(0.01)
+                will_timeout = True
+                break
+
+            time.sleep(SLEEP)
+
+        # Mark the task as complete
+        for index in self.buffer_index_map.keys():
+            _input_buffers_states[index] = 0 if PY3 else "0"
+
+        if will_timeout:
+            raise TimeoutExceededError()
 
         # Convert list and possibly raise exception
         results = []
@@ -186,41 +216,33 @@ class Task(object):
         return results
 
 
-def fetch_and_run(lock, input_buffers_states):
+def fetch_and_run(lock):
     global _input_buffers
+    global _input_buffers_states
     global _output_buffers
 
+    SLEEP = 0.005
+
     while True:
+        for index in range(BUFFER_DEPTH):
 
-        # Only consider input buffers known to be active
-        for index, status in enumerate(input_buffers_states):
-            if status != 1:
-                time.sleep(0.01)
+            # Consider input buffers known to hold an assigned job. The first
+            # part checks eshews a lock because it is much faster. This second
+            # part must be locked because that is cheaper than potentially
+            # running a job twice.
+            if _input_buffers_states[index] not in (1, "1"):
                 continue
 
-            # First check is cheap because we read only one byte
-            mm = _input_buffers[index]
-            mm.seek(0)
-            data = mm.read(1).decode("utf-8")
-            if data[0] == "\x00":
-                time.sleep(0.01)
-                continue
-
-            # Second check reads all the bytes and requires a lock
             lock.acquire()
-            try:
-                mm.seek(0)
-                data = mm.read(MMAP_SIZE).decode("utf-8")
-                if data[0] != "\x00":
-                    mm.seek(0)
-                    mm.write(b"\x00")
-            finally:
+            if _input_buffers_states[index] not in (1, "1"):
                 lock.release()
-
-            # Paranoia check
-            if data[0] == "\x00":
-                time.sleep(0.01)
                 continue
+
+            # Mark input buffer as in progress
+            _input_buffers_states[index] = 2 if PY3 else "2"
+            lock.release()
+
+            data = _input_buffers[index][:].decode("utf-8")
 
             # Decode the bytes
             length = int(data[:6])
@@ -240,12 +262,14 @@ def fetch_and_run(lock, input_buffers_states):
                 elif serialization_format == "json":
                     # We need it to be 6 chars
                     serialization_format = "json  "
-                    serialized = json.dumps(result, indent=4)
+                    serialized = json.dumps(result)
                 elif serialization_format == "string":
                     serialized = result
 
                 # No need for locking because we are guaranteed to be the only
-                # one writing to it.
+                # one writing to it. Actually, there is a very tiny chance
+                # another worker performed the same job but at worst we do a
+                # little extra work.
                 mm = _output_buffers[index]
                 mm.seek(0)
                 mm.write(
@@ -255,7 +279,12 @@ def fetch_and_run(lock, input_buffers_states):
                         + serialized
                     ).encode("utf-8")
                 )
+
+                # Mark input buffer as containing a result
+                _input_buffers_states[index] = 3 if PY3 else "3"
+
             except Exception as exc:
+                # No need for buffer cleanup. Get will do that.
                 msg = traceback.format_exc()
                 pickled = pickle.dumps(Traceback(exc, msg), 0).decode("utf-8")
                 mm = _output_buffers[index]
@@ -268,7 +297,7 @@ def fetch_and_run(lock, input_buffers_states):
                     ).encode("utf-8")
                 )
 
-        time.sleep(0.01)
+        time.sleep(SLEEP)
 
 
 def initialize():
@@ -276,10 +305,12 @@ def initialize():
     tests."""
 
     global NUMBER_OF_WORKERS
+    global BUFFER_DEPTH
     global _workers
     global _input_buffers
     global _input_buffers_states
     global _output_buffers
+    global _lock_fetch
 
     # If we already have workers do nothing
     if _workers:
@@ -287,15 +318,17 @@ def initialize():
 
     _input_buffers = []
     _output_buffers = []
-    for i in range(NUMBER_OF_WORKERS * 8):
+    for i in range(BUFFER_DEPTH):
         # Input buffers are smaller than output buffers
         _input_buffers.append(mmap.mmap(-1, 10000))
         _output_buffers.append(mmap.mmap(-1, MMAP_SIZE))
 
-    _input_buffers_states = Array("i", NUMBER_OF_WORKERS * 8)
+    _input_buffers_states = mmap.mmap(-1, BUFFER_DEPTH)
+    for i in range(BUFFER_DEPTH):
+        _input_buffers_states[i] = 0 if PY3 else "0"
 
     for i in range(0, NUMBER_OF_WORKERS):
-        p = Process(target=fetch_and_run, args=(_lock, _input_buffers_states))
+        p = Process(target=fetch_and_run, args=(_lock_fetch,))
         _workers.append(p)
         p.start()
 
