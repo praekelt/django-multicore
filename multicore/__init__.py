@@ -322,6 +322,7 @@ def initialize(force=False):
         for arg in sys.argv:
             if (arg == "runserver") or (".wsgi" in arg):
                 b = True
+                break
         if not b:
             return
 
