@@ -136,13 +136,6 @@ creates a multicore task::
 
     MULTICORE = {"max-load-average": 85}
 
-Multicore attempts to use pipes for inter-process communication but you may instruct it to
-use the filesystem. In fact, with PyPy you cannot use pipes and it will automatically
-switch to temporary files.::
-
-    MULTICORE = {"pipes": False}
-
-
 FAQ's
 -----
 
@@ -167,7 +160,8 @@ parallel. You may also set `max_load_average` as a further guard.
 Why didn't you use multiprocessing.Pool?
 ****************************************
 
-It just has too many issues with Django when it comes to scoping.
+It just has too many issues with Django when it comes to scoping. Even pipes
+and sockets introduce too much overhead, so memory mapping is used.
 
 Do you have any benchmarks?
 ***************************
@@ -177,4 +171,7 @@ No, because this is just an interface, not a collection of parallel code.
 Okay... the unit test is 3 times as fast on a quad core machine. And the Django
 Rest Framework code in this doc is 2 times as fast on the same quad core
 machine. Note that it is very dependent on the type of serializer and data.
+
+In general the code scales nearly linearly if you don't access the database.
+Multicore itself adds about 5 milliseconds overhead on my machine.
 
