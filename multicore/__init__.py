@@ -15,6 +15,8 @@ import dill
 
 from django.conf import settings
 
+from multicore import exceptions
+
 
 PY3 = sys.version_info[0] == 3
 
@@ -78,21 +80,15 @@ class Traceback(object):
         raise self.exc.__class__(self.msg)
 
 
-class TimeoutExceededError(Exception):
-    pass
-
-
-class NoAvailableInputBufferError(Exception):
-    pass
-
-
-class InputBufferTooSmallError(Exception):
-    pass
-
-
 class Task(object):
 
     def __new__(cls, *args, **kwargs):
+        global _workers
+
+        # No workers no work
+        if not _workers:
+            return None
+
         # If the load average for the last minute is larger than a defined
         # threshold then don't return a task. Note that the threshold is
         # specified as for a single core machine, so we multiply it with the
@@ -149,7 +145,7 @@ class Task(object):
                 # Effectively cancel the rest of the task
                 for i in self.buffer_index_map.keys():
                     _input_buffers_states[index] = 0 if PY3 else "0"
-                raise NoAvailableInputBufferError()
+                raise exceptions.NoAvailableInputBufferError()
 
             self.buffer_index_map[index] = self.count
             mm = _input_buffers[index]
@@ -157,7 +153,7 @@ class Task(object):
             try:
                 mm.write(("%.6d" % len(pickled) + pickled).encode("utf-8"))
             except ValueError:
-                raise InputBufferTooSmallError()
+                raise exceptions.InputBufferTooSmallError()
 
             # Mark input buffer as holding a job
             _input_buffers_states[index] = 1 if PY3 else "1"
@@ -201,7 +197,7 @@ class Task(object):
             _input_buffers_states[index] = 0 if PY3 else "0"
 
         if will_timeout:
-            raise TimeoutExceededError()
+            raise exceptions.TimeoutExceededError()
 
         # Convert list and possibly raise exception
         results = []
@@ -307,7 +303,7 @@ def fetch_and_run(lock):
         time.sleep(SLEEP)
 
 
-def initialize():
+def initialize(force=False):
     """Start the queue workers if needed. Called by app.ready and possibly unit
     tests."""
 
@@ -318,6 +314,16 @@ def initialize():
     global _input_buffers_states
     global _output_buffers
     global _lock_fetch
+
+    # Multicore only makes sense if we're running as a server or in our unit
+    # tests. There doesn't seem to be a clean way to test for it.
+    if not force:
+        b = False
+        for arg in sys.argv:
+            if (arg == "runserver") or (".wsgi" in arg):
+                b = True
+        if not b:
+            return
 
     # If we already have workers do nothing
     if _workers:

@@ -44,7 +44,7 @@ class TaskTestCase(TestCase):
     def test_speed(self):
         with override_settings(MULTICORE={"pipes": True}):
             # Initialize manually because we change a fundemental setting
-            initialize()
+            initialize(force=True)
 
             # Sync
             t_start = time.time()
@@ -67,4 +67,4 @@ class TaskTestCase(TestCase):
             self.failUnless(duration_async < duration_sync)
 
     def test_no_deadlock(self):
-        initialize()
+        initialize(force=True)
