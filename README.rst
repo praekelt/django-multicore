@@ -154,8 +154,8 @@ reduce the response time of each individual request.
 Will it try to execute hundreds of pieces of code in parallel?
 **************************************************************
 
-No. The pool has a fixed size and can only execute number-of-cores tasks in
-parallel. You may also set `max_load_average` as a further guard.
+No. The worker pool has a fixed size and can only execute number-of-cores
+tasks in parallel. You may also set `max_load_average` as a further guard.
 
 Why didn't you use multiprocessing.Pool?
 ****************************************
@@ -174,4 +174,16 @@ machine. Note that it is very dependent on the type of serializer and data.
 
 In general the code scales nearly linearly if you don't access the database.
 Multicore itself adds about 5 milliseconds overhead on my machine.
+
+Multicore and Gunicorn
+**********************
+
+Django is typically run as a WSGI server in a production environment and it
+pre-forks to a user-defined number of Gunicorn workers. Each Gunicorn worker
+will also get its own pool of multicore workers so you end up with many more
+Python processes. It's not possible to make all the Gunicorn workers use the
+multicore worker pool from the master Django process because we use memory
+mapping for inter process communications, not pipes.
+
+In practice this is not a problem - performance remains very good.
 
