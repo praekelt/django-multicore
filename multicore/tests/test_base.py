@@ -42,29 +42,28 @@ class TaskTestCase(TestCase):
         shutdown()
 
     def test_speed(self):
-        with override_settings(MULTICORE={"pipes": True}):
-            # Initialize manually because we change a fundemental setting
-            initialize(force=True)
+        # Initialize manually because we change a fundemental setting
+        initialize(force=True)
 
-            # Sync
-            t_start = time.time()
-            s_sync = ""
-            for user in users:
-                s_sync += expensive_render(user)
-            duration_sync = time.time() - t_start
+        # Sync
+        t_start = time.time()
+        s_sync = ""
+        for user in users:
+            s_sync += expensive_render(user)
+        duration_sync = time.time() - t_start
 
-            # Async. Break into chunks of tasks.
-            t_start = time.time()
-            task = Task()
-            for start, end in ranges(users):
-                task.run(multi_expensive_render, start, end)
+        # Async. Break into chunks of tasks.
+        t_start = time.time()
+        task = Task()
+        for start, end in ranges(users):
+            task.run(multi_expensive_render, start, end)
 
-            s_async = "".join(task.get())
-            duration_async = time.time() - t_start
+        s_async = "".join(task.get())
+        duration_async = time.time() - t_start
 
-            # Hopefully we're on a multicore machine :)
-            self.assertEqual(s_sync, s_async)
-            self.failUnless(duration_async < duration_sync)
+        # Hopefully we're on a multicore machine :)
+        self.assertEqual(s_sync, s_async)
+        self.failUnless(duration_async < duration_sync)
 
     def test_no_deadlock(self):
         initialize(force=True)

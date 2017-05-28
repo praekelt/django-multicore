@@ -33,6 +33,13 @@ Features
 #. Can take system load average into account to decide whether parallelization
    is worth it at any given time.
 
+Architecture
+------------
+
+Django Multicore is effectively an in-memory queue that is processed by a fixed
+set of workers. It uses memory mapping to avoid the latency imposed by using a
+queing system such as celery.
+
 Usage
 -----
 
